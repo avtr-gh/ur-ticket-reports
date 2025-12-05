@@ -2,3 +2,5 @@ boto3
 python-dotenv
 Flask
 gunicorn
+requests
+supabase
