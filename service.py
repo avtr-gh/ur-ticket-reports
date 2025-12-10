@@ -15,7 +15,7 @@ def healthz():
     return ("ok", 200)
 
 
-@app.route("/latest-report", methods=["GET"])
+@app.route("/sync-urticket", methods=["GET"])
 def latest():
     result = process_and_sync()
     if not result:
