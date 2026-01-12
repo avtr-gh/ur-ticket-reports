@@ -1,9 +1,10 @@
 import csv
 from io import StringIO
 from datetime import datetime, timezone
+import re
 
 from clients import supabase, fetch_latest_csv
-from parsers import to_int, parse_currency, map_payment_method, parse_datetime
+from parsers import to_int, parse_currency, map_payment_method, normalize_event_name, parse_datetime
 from urticket import fetch_ticket_types_from_api
 
 
@@ -37,19 +38,22 @@ def process_event_new(event_id: int, event_rows: list):
         return {"success": False, "message": "No rows for event"}
 
     first = event_rows[0]
-    event_name = first.get("event_name")
+    event_name = first.get("event_name") or ""
+    # Normalize (uppercase, remove accents, punctuation) before trimming time suffix
+    event_name = normalize_event_name(event_name)
+    # Expresión regular para ' HH:MM HRS' (se ejecuta sobre la cadena normalizada)
+    event_name = re.sub(r"\s+\d{1,2}:\d{2}\s*HRS$", "", event_name, flags=re.IGNORECASE).strip()
+
     start_datetime_raw = first.get("start_datetime")
     start_datetime = parse_datetime(start_datetime_raw)
     if start_datetime is None and start_datetime_raw:
+        # keep None if parsing failed; Postgres will error if raw format provided
         print(f"Warning: couldn't parse start_datetime '{start_datetime_raw}' for event {event_id}; storing NULL")
 
     end_datetime_raw = first.get("end_datetime")
-    end_datetime = None
-    if end_datetime_raw:
-        try:
-            end_datetime = str(datetime.strptime(end_datetime_raw[:10], "%Y-%m-%d").date())
-        except Exception:
-            print(f"Warning: couldn't parse end_datetime '{end_datetime_raw}' for event {event_id}; storing NULL")
+    end_datetime = parse_datetime(end_datetime_raw)
+    if end_datetime is None and end_datetime_raw:
+        print(f"Warning: couldn't parse end_datetime '{end_datetime_raw}' for event {event_id}; storing NULL")
 
     supabase.table("events").upsert({
         "id": event_id,
@@ -73,42 +77,76 @@ def process_event_new(event_id: int, event_rows: list):
             "total_stock": int(total_stock)
         }).execute()
 
-    inserted = 0
+    # Aggregate rows by (ticket_type_id, payment_method_id) so sales across
+    # different 'Intervalo de tiempo' (años) merge into the same event_sales record.
+    aggregates = {}
     for row in event_rows:
         ticket_type_id = to_int(row.get("ticket_type_id"))
         if ticket_type_id == 0:
             continue
 
-        qty = to_int(row.get("total_tickets") or row.get("qty"))
         payment_method_id = map_payment_method(row.get("payment_method")) or 6
 
+        qty = to_int(row.get("total_tickets") or row.get("qty"))
         price_gross = parse_currency(row.get("price_gross"))
+        price_net = parse_currency(row.get("price_net"))
         refund_total = parse_currency(row.get("refund_online")) + parse_currency(row.get("refund_offline"))
         fee = parse_currency(row.get("fee"))
         discount = parse_currency(row.get("discount"))
-        price_net = parse_currency(row.get("price_net"))
 
         payment_gateway_raw = row.get("payment_gateway")
         payment_gateway = payment_gateway_raw.strip() if payment_gateway_raw else None
         if payment_gateway == "":
             payment_gateway = None
 
-        supabase.table("event_sales").insert({
-            "event_id": event_id,
-            "ticket_type_id": ticket_type_id,
-            "payment_method_id": payment_method_id,
-            "qty": qty,
-            "price_gross": price_gross,
-            "price_net": price_net,
-            "refund": refund_total,
-            "fee": fee,
-            "discount": discount,
-            "payment_gateway": payment_gateway
-        }).execute()
-        inserted += 1
+        key = (ticket_type_id, payment_method_id)
+        if key not in aggregates:
+            aggregates[key] = {
+                "event_id": event_id,
+                "ticket_type_id": ticket_type_id,
+                "payment_method_id": payment_method_id,
+                "qty": 0,
+                "price_gross": 0.0,
+                "price_net": 0.0,
+                "refund": 0.0,
+                "fee": 0.0,
+                "discount": 0.0,
+                "payment_gateway": payment_gateway,
+            }
 
-    return {"success": True, "event_id": event_id, "inserted_sales": inserted}
+        agg = aggregates[key]
+        agg["qty"] += qty
+        # Sum monetary totals across rows so aggregated record reflects totals
+        agg["price_gross"] += price_gross
+        agg["price_net"] += price_net
+        agg["refund"] += refund_total
+        agg["fee"] += fee
+        agg["discount"] += discount
+        if not agg["payment_gateway"] and payment_gateway:
+            agg["payment_gateway"] = payment_gateway
 
+    # Read existing event_sales for this event to ensure idempotent behavior
+    resp_existing = supabase.table("event_sales").select("*").eq("event_id", event_id).execute()
+    existing_sales = {}
+    if resp_existing.data:
+        for s in resp_existing.data:
+            key = (s.get("ticket_type_id"), s.get("payment_method_id"))
+            existing_sales[key] = s
+
+    inserts = 0
+    updates = 0
+    for new_obj in aggregates.values():
+        key = (new_obj.get("ticket_type_id"), new_obj.get("payment_method_id"))
+        if key not in existing_sales:
+            supabase.table("event_sales").insert(new_obj).execute()
+            inserts += 1
+        else:
+            existing_row = existing_sales[key]
+            if sale_needs_update(existing_row, new_obj):
+                supabase.table("event_sales").update(new_obj).eq("id", existing_row["id"]).execute()
+                updates += 1
+
+    return {"success": True, "event_id": event_id, "inserted_sales": inserts, "updated_sales": updates}
 
 def sync_existing_event(event_id: int, event_rows: list):
     resp_tt = supabase.table("ticket_type").select("*").eq("event_id", event_id).execute()
@@ -147,8 +185,10 @@ def sync_existing_event(event_id: int, event_rows: list):
             key = (s.get("ticket_type_id"), s.get("payment_method_id"))
             existing_sales[key] = s
 
-    inserts = 0
-    updates = 0
+    # Aggregate incoming rows by (ticket_type_id, payment_method_id) to
+    # merge rows that differ only by 'Intervalo de tiempo' (year) before
+    # inserting/updating event_sales.
+    aggregates = {}
     for row in event_rows:
         ticket_type_id = to_int(row.get("ticket_type_id"))
         if ticket_type_id == 0:
@@ -156,12 +196,12 @@ def sync_existing_event(event_id: int, event_rows: list):
 
         payment_method_id = map_payment_method(row.get("payment_method")) or 6
 
-        qty = to_int(row.get("total_tickets"))
+        qty = to_int(row.get("total_tickets") or row.get("qty"))
         price_gross = parse_currency(row.get("price_gross"))
+        price_net = parse_currency(row.get("price_net"))
         refund_total = parse_currency(row.get("refund_online")) + parse_currency(row.get("refund_offline"))
         fee = parse_currency(row.get("fee"))
         discount = parse_currency(row.get("discount"))
-        price_net = parse_currency(row.get("price_net"))
 
         payment_gateway_raw = row.get("payment_gateway")
         payment_gateway = payment_gateway_raw.strip() if payment_gateway_raw else None
@@ -169,19 +209,34 @@ def sync_existing_event(event_id: int, event_rows: list):
             payment_gateway = None
 
         key = (ticket_type_id, payment_method_id)
-        new_obj = {
-            "event_id": event_id,
-            "ticket_type_id": ticket_type_id,
-            "payment_method_id": payment_method_id,
-            "qty": qty,
-            "price_gross": price_gross,
-            "price_net": price_net,
-            "refund": refund_total,
-            "fee": fee,
-            "discount": discount,
-            "payment_gateway": payment_gateway
-        }
+        if key not in aggregates:
+            aggregates[key] = {
+                "event_id": event_id,
+                "ticket_type_id": ticket_type_id,
+                "payment_method_id": payment_method_id,
+                "qty": 0,
+                "price_gross": 0.0,
+                "price_net": 0.0,
+                "refund": 0.0,
+                "fee": 0.0,
+                "discount": 0.0,
+                "payment_gateway": payment_gateway,
+            }
 
+        agg = aggregates[key]
+        agg["qty"] += qty
+        agg["price_gross"] += price_gross
+        agg["price_net"] += price_net
+        agg["refund"] += refund_total
+        agg["fee"] += fee
+        agg["discount"] += discount
+        if not agg["payment_gateway"] and payment_gateway:
+            agg["payment_gateway"] = payment_gateway
+
+    inserts = 0
+    updates = 0
+    for new_obj in aggregates.values():
+        key = (new_obj.get("ticket_type_id"), new_obj.get("payment_method_id"))
         if key not in existing_sales:
             supabase.table("event_sales").insert(new_obj).execute()
             inserts += 1

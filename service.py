@@ -2,6 +2,7 @@ from flask import Flask, jsonify
 from app import process_and_sync
 import logging
 import os
+import json
 
 app = Flask(__name__)
 
@@ -18,6 +19,11 @@ def healthz():
 @app.route("/sync-urticket", methods=["GET"])
 def latest():
     result = process_and_sync()
+    # Print formatted result so Cloud Run logs show readable output
+    try:
+        logging.info("Sync result:\n%s", json.dumps(result, indent=2, ensure_ascii=False))
+    except Exception:
+        logging.info("Sync result: %s", result)
     if not result:
         return jsonify({
             "success": False,

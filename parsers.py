@@ -3,6 +3,20 @@ import re
 from datetime import datetime, timezone
 
 
+def normalize_event_name(name: str) -> str:
+    if not name:
+        return ""
+    s = str(name).upper()
+    # remove diacritics
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    # remove common punctuation except colon
+    s = re.sub(r"[\,\.\'\"“”`´;\-–—\(\)\[\]]", "", s)
+    # collapse multiple spaces
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def normalize_text(text: str) -> str:
     if not text:
         return ""
@@ -93,6 +107,7 @@ def parse_datetime(value: str):
     if not value:
         return None
     v = str(value).strip()
+    # If it's already ISO-like, try parsing
     if "T" in v or "+" in v or "Z" in v:
         try:
             dt = datetime.fromisoformat(v)
